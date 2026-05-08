@@ -6,8 +6,19 @@ use crate::encoding::{EncodeMetric, MetricEncoder, NoLabelSet};
 
 use super::{MetricType, TypedMetric};
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
+use std::collections::BTreeMap;
 use std::iter::{self, once};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+/// Special zero-threshold sentinel that configures a zero-width zero bucket.
+pub const NATIVE_HISTOGRAM_ZERO_THRESHOLD_ZERO: f64 = -1.0;
+
+/// Default bucket factor for native histograms.
+pub const DEFAULT_NATIVE_HISTOGRAM_BUCKET_FACTOR: f64 = 1.1;
+
+const SCHEMA_MIN: i8 = -4;
+const SCHEMA_MAX: i8 = 8;
 
 /// Open Metrics [`Histogram`] to measure distributions of discrete events.
 ///
@@ -53,6 +64,221 @@ pub(crate) struct Inner {
     count: u64,
     // TODO: Consider being generic over the bucket length.
     buckets: Vec<(f64, u64)>,
+    native: Option<NativeHistogramState>,
+}
+
+/// Configuration for native histogram buckets.
+///
+/// Native histogram exemplars are not currently emitted.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeHistogramConfig {
+    schema: i8,
+    zero_threshold: f64,
+    max_buckets: usize,
+    min_reset_duration: Option<Duration>,
+    max_zero_threshold: f64,
+}
+
+impl NativeHistogramConfig {
+    /// Create a native histogram configuration with the provided bucket factor.
+    ///
+    /// The schema is chosen so that the bucket growth factor is the largest
+    /// supported factor that is still <= `bucket_factor`. The default zero
+    /// threshold is 2^-128, as recommended by the Prometheus native histogram
+    /// specification.
+    pub fn new(bucket_factor: f64) -> Self {
+        Self::with_bucket_factor(bucket_factor)
+    }
+
+    /// Create a native histogram configuration with the provided schema.
+    ///
+    /// Valid standard schema values are in [-4, 8]. Prefer [`Self::new`] unless
+    /// you explicitly need a schema-level configuration.
+    pub fn with_schema(schema: i8) -> Self {
+        assert!((SCHEMA_MIN..=SCHEMA_MAX).contains(&schema));
+
+        Self {
+            schema,
+            zero_threshold: 2f64.powi(-128),
+            max_buckets: 0,
+            min_reset_duration: None,
+            max_zero_threshold: 0.0,
+        }
+    }
+
+    /// Create a native histogram configuration by choosing the schema whose
+    /// growth factor is the largest factor <= `bucket_factor`.
+    pub fn with_bucket_factor(bucket_factor: f64) -> Self {
+        assert!(bucket_factor > 1.0);
+        Self::with_schema(pick_schema(bucket_factor))
+    }
+
+    /// Set a custom zero threshold.
+    pub fn zero_threshold(mut self, zero_threshold: f64) -> Self {
+        assert!(zero_threshold.is_finite());
+        self.zero_threshold = zero_threshold;
+        self
+    }
+
+    /// Set a best-effort maximum number of sparse buckets across both sides.
+    ///
+    /// `0` means unbounded. If the lowest supported resolution still exceeds
+    /// the limit, observations remain in sparse buckets until a later zero
+    /// bucket widening can merge them.
+    pub fn max_buckets(mut self, max_buckets: usize) -> Self {
+        self.max_buckets = max_buckets;
+        self
+    }
+
+    /// Reset the histogram instead of reducing resolution if the bucket limit
+    /// is exceeded after at least this duration has elapsed since creation or
+    /// the last reset. A zero duration disables reset-based limiting.
+    pub fn min_reset_duration(mut self, min_reset_duration: Duration) -> Self {
+        self.min_reset_duration =
+            (min_reset_duration != Duration::ZERO).then_some(min_reset_duration);
+        self
+    }
+
+    /// Set the maximum zero threshold allowed while enforcing `max_buckets`.
+    ///
+    /// The default is `0.0`, which disables zero-bucket widening unless the
+    /// current threshold is already below a configured positive maximum.
+    pub fn max_zero_threshold(mut self, max_zero_threshold: f64) -> Self {
+        assert!(max_zero_threshold.is_finite());
+        assert!(max_zero_threshold >= 0.0);
+        self.max_zero_threshold = max_zero_threshold;
+        self
+    }
+}
+
+impl Default for NativeHistogramConfig {
+    fn default() -> Self {
+        Self::new(DEFAULT_NATIVE_HISTOGRAM_BUCKET_FACTOR)
+    }
+}
+
+#[derive(Debug)]
+struct NativeHistogramState {
+    initial_zero_threshold: f64,
+    initial_schema: i8,
+    zero_threshold: f64,
+    zero_count: u64,
+    schema: i8,
+    max_buckets: usize,
+    min_reset_duration: Option<Duration>,
+    max_zero_threshold: f64,
+    created: SystemTime,
+    scheduled_reset: Option<SystemTime>,
+    positive: BTreeMap<i32, u64>,
+    negative: BTreeMap<i32, u64>,
+}
+
+#[derive(Debug)]
+struct NativeHistogramSnapshot {
+    schema: i32,
+    zero_threshold: f64,
+    zero_count: u64,
+    negative_spans: Vec<(i32, u32)>,
+    negative_deltas: Vec<i64>,
+    positive_spans: Vec<(i32, u32)>,
+    positive_deltas: Vec<i64>,
+    created: SystemTime,
+}
+
+impl NativeHistogramState {
+    fn new(config: NativeHistogramConfig) -> Self {
+        let created = SystemTime::now();
+        Self {
+            initial_zero_threshold: config.zero_threshold,
+            initial_schema: config.schema,
+            zero_threshold: config.zero_threshold,
+            zero_count: 0,
+            schema: config.schema,
+            max_buckets: config.max_buckets,
+            min_reset_duration: config.min_reset_duration,
+            max_zero_threshold: config.max_zero_threshold,
+            created,
+            scheduled_reset: None,
+            positive: BTreeMap::new(),
+            negative: BTreeMap::new(),
+        }
+    }
+
+    fn observe(&mut self, v: f64) -> bool {
+        if in_zero_bucket(self.zero_threshold, v) {
+            self.zero_count += 1;
+            return enforce_bucket_limit(self);
+        }
+
+        let index = bucket_index(self.schema, v.abs(), v.is_infinite());
+        if v.is_sign_negative() {
+            *self.negative.entry(index).or_insert(0) += 1;
+        } else {
+            *self.positive.entry(index).or_insert(0) += 1;
+        }
+
+        enforce_bucket_limit(self)
+    }
+
+    fn reset(&mut self, created: SystemTime) {
+        self.zero_threshold = self.initial_zero_threshold;
+        self.zero_count = 0;
+        self.schema = self.initial_schema;
+        self.created = created;
+        self.scheduled_reset = None;
+        self.positive.clear();
+        self.negative.clear();
+    }
+
+    fn reset_is_due(&self, now: SystemTime) -> bool {
+        self.scheduled_reset
+            .and_then(|scheduled_reset| now.duration_since(scheduled_reset).ok())
+            .is_some()
+    }
+
+    fn schedule_reset_after_degradation(&mut self) {
+        if self.scheduled_reset.is_none() {
+            self.scheduled_reset = self
+                .min_reset_duration
+                .and_then(|duration| self.created.checked_add(duration));
+        }
+    }
+
+    fn snapshot(&self) -> Result<NativeHistogramSnapshot, std::fmt::Error> {
+        let (mut negative_spans, negative_deltas) = encode_spans_and_deltas(&self.negative)?;
+        let (mut positive_spans, positive_deltas) = encode_spans_and_deltas(&self.positive)?;
+
+        let exported_zero_threshold = if self.zero_threshold < 0.0 {
+            0.0
+        } else {
+            self.zero_threshold
+        };
+
+        // Distinguish a native histogram from a classic histogram in protobuf
+        // when it has no sparse bucket data and zero threshold is zero.
+        if exported_zero_threshold == 0.0
+            && self.zero_count == 0
+            && positive_spans.is_empty()
+            && negative_spans.is_empty()
+        {
+            positive_spans.push((0, 0));
+        }
+
+        if self.negative.is_empty() {
+            negative_spans.clear();
+        }
+
+        Ok(NativeHistogramSnapshot {
+            schema: self.schema as i32,
+            zero_threshold: exported_zero_threshold,
+            zero_count: self.zero_count,
+            negative_spans,
+            negative_deltas,
+            positive_spans,
+            positive_deltas,
+            created: self.created,
+        })
+    }
 }
 
 impl Histogram {
@@ -63,6 +289,11 @@ impl Histogram {
     /// let histogram = Histogram::new([10.0, 100.0, 1_000.0]);
     /// ```
     pub fn new(buckets: impl IntoIterator<Item = f64>) -> Self {
+        Self::new_classic(buckets)
+    }
+
+    /// Create a new classic [`Histogram`].
+    pub fn new_classic(buckets: impl IntoIterator<Item = f64>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner {
                 sum: Default::default(),
@@ -72,8 +303,39 @@ impl Histogram {
                     .chain(once(f64::MAX))
                     .map(|upper_bound| (upper_bound, 0))
                     .collect(),
+                native: None,
             })),
         }
+    }
+
+    /// Create a new native [`Histogram`] without classic buckets.
+    ///
+    /// Native-only histograms can only be encoded by the Prometheus protobuf
+    /// encoder. Text and OpenMetrics protobuf encoders do not have native
+    /// histogram fields and reject native-only histograms.
+    pub fn new_native(native: NativeHistogramConfig) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Inner {
+                sum: Default::default(),
+                count: Default::default(),
+                buckets: Vec::new(),
+                native: Some(NativeHistogramState::new(native)),
+            })),
+        }
+    }
+
+    /// Create a new [`Histogram`] with both classic and native buckets.
+    ///
+    /// Prometheus protobuf encodes both representations in one histogram
+    /// message. Encoders without native histogram support encode the classic
+    /// buckets.
+    pub fn new_classic_and_native(
+        buckets: impl IntoIterator<Item = f64>,
+        native: NativeHistogramConfig,
+    ) -> Self {
+        let histogram = Self::new_classic(buckets);
+        histogram.inner.write().native = Some(NativeHistogramState::new(native));
+        histogram
     }
 
     /// Observe the given value.
@@ -100,22 +362,27 @@ impl Histogram {
     /// [`HistogramWithExemplars`](crate::metrics::exemplar::HistogramWithExemplars).
     pub(crate) fn observe_and_bucket(&self, v: f64) -> Option<usize> {
         let mut inner = self.inner.write();
-        inner.sum += v;
-        inner.count += 1;
+        reset_if_scheduled(&mut inner, SystemTime::now());
+        let mut bucket = observe_classic(&mut inner, v);
 
-        let first_bucket = inner
-            .buckets
-            .iter_mut()
-            .enumerate()
-            .find(|(_i, (upper_bound, _value))| upper_bound >= &v);
+        let reset = if let Some(native) = &mut inner.native {
+            !v.is_nan() && native.observe(v)
+        } else {
+            false
+        };
 
-        match first_bucket {
-            Some((i, (_upper_bound, value))) => {
-                *value += 1;
-                Some(i)
+        if reset {
+            let created = SystemTime::now();
+            reset_observations(&mut inner, created);
+            bucket = observe_classic(&mut inner, v);
+            if let Some(native) = &mut inner.native {
+                if !v.is_nan() {
+                    native.observe(v);
+                }
             }
-            None => None,
         }
+
+        bucket
     }
 
     pub(crate) fn get(&self) -> (f64, u64, MappedRwLockReadGuard<'_, Vec<(f64, u64)>>) {
@@ -124,6 +391,20 @@ impl Histogram {
         let count = inner.count;
         let buckets = RwLockReadGuard::map(inner, |inner| &inner.buckets);
         (sum, count, buckets)
+    }
+
+    fn snapshot(
+        &self,
+    ) -> Result<(f64, u64, Vec<(f64, u64)>, Option<NativeHistogramSnapshot>), std::fmt::Error> {
+        let mut inner = self.inner.write();
+        reset_if_scheduled(&mut inner, SystemTime::now());
+        let native = inner
+            .native
+            .as_ref()
+            .map(NativeHistogramState::snapshot)
+            .transpose()?;
+
+        Ok((inner.sum, inner.count, inner.buckets.clone(), native))
     }
 }
 
@@ -173,13 +454,843 @@ pub fn linear_buckets(start: f64, width: f64, length: u16) -> impl Iterator<Item
 
 impl EncodeMetric for Histogram {
     fn encode(&self, mut encoder: MetricEncoder) -> Result<(), std::fmt::Error> {
-        let (sum, count, buckets) = self.get();
-        encoder.encode_histogram::<NoLabelSet>(sum, count, &buckets, None)
+        let (sum, count, buckets, native) = self.snapshot()?;
+        match native {
+            Some(native) => encoder.encode_histogram_with_native::<NoLabelSet>(
+                sum,
+                count,
+                &buckets,
+                None,
+                native.schema,
+                native.zero_threshold,
+                native.zero_count,
+                &native.negative_spans,
+                &native.negative_deltas,
+                &native.positive_spans,
+                &native.positive_deltas,
+                Some(native.created),
+            ),
+            None => encoder.encode_histogram::<NoLabelSet>(sum, count, &buckets, None),
+        }
     }
 
     fn metric_type(&self) -> MetricType {
         Self::TYPE
     }
+}
+
+fn observe_classic(inner: &mut Inner, v: f64) -> Option<usize> {
+    inner.sum += v;
+    inner.count += 1;
+
+    let first_bucket = if v.is_nan() {
+        inner.buckets.iter_mut().enumerate().next_back()
+    } else {
+        inner
+            .buckets
+            .iter_mut()
+            .enumerate()
+            .find(|(_i, (upper_bound, _value))| upper_bound >= &v)
+    };
+
+    match first_bucket {
+        Some((i, (_upper_bound, value))) => {
+            *value += 1;
+            Some(i)
+        }
+        None => None,
+    }
+}
+
+fn reset_observations(inner: &mut Inner, created: SystemTime) {
+    inner.sum = 0.0;
+    inner.count = 0;
+    for (_, count) in &mut inner.buckets {
+        *count = 0;
+    }
+    if let Some(native) = &mut inner.native {
+        native.reset(created);
+    }
+}
+
+fn reset_if_scheduled(inner: &mut Inner, now: SystemTime) {
+    if inner
+        .native
+        .as_ref()
+        .map(|native| native.reset_is_due(now))
+        .unwrap_or(false)
+    {
+        reset_observations(inner, now);
+    }
+}
+
+fn in_zero_bucket(zero_threshold: f64, v: f64) -> bool {
+    if zero_threshold < 0.0 {
+        v == 0.0
+    } else {
+        v.abs() <= zero_threshold
+    }
+}
+
+fn pick_schema(bucket_factor: f64) -> i8 {
+    let floor = bucket_factor.log2().log2().floor();
+    if floor <= -(SCHEMA_MAX as f64) {
+        return SCHEMA_MAX;
+    }
+
+    if floor >= -(SCHEMA_MIN as f64) {
+        return SCHEMA_MIN;
+    }
+
+    -(floor as i8)
+}
+
+fn native_histogram_bounds() -> &'static [&'static [f64]; 9] {
+    &NATIVE_HISTOGRAM_BOUNDS
+}
+
+const NATIVE_HISTOGRAM_BOUNDS: [&[f64]; 9] = [
+    &[0.5],
+    &[0.5, 0.7071067811865475],
+    &[
+        0.5,
+        0.5946035575013605,
+        0.7071067811865475,
+        0.8408964152537144,
+    ],
+    &[
+        0.5,
+        0.5452538663326288,
+        0.5946035575013605,
+        0.6484197773255048,
+        0.7071067811865475,
+        0.7711054127039704,
+        0.8408964152537144,
+        0.9170040432046711,
+    ],
+    &[
+        0.5,
+        0.5221368912137069,
+        0.5452538663326288,
+        0.5693943173783458,
+        0.5946035575013605,
+        0.620928906036742,
+        0.6484197773255048,
+        0.6771277734684463,
+        0.7071067811865475,
+        0.7384130729697496,
+        0.7711054127039704,
+        0.805245165974627,
+        0.8408964152537144,
+        0.8781260801866495,
+        0.9170040432046711,
+        0.9576032806985735,
+    ],
+    &[
+        0.5,
+        0.5109485743270583,
+        0.5221368912137069,
+        0.5335702003384117,
+        0.5452538663326288,
+        0.5571933712979462,
+        0.5693943173783458,
+        0.5818624293887887,
+        0.5946035575013605,
+        0.6076236799902344,
+        0.620928906036742,
+        0.6345254785958666,
+        0.6484197773255048,
+        0.6626183215798706,
+        0.6771277734684463,
+        0.6919549409819159,
+        0.7071067811865475,
+        0.7225904034885232,
+        0.7384130729697496,
+        0.7545822137967112,
+        0.7711054127039704,
+        0.7879904225539431,
+        0.805245165974627,
+        0.8228777390769823,
+        0.8408964152537144,
+        0.8593096490612387,
+        0.8781260801866495,
+        0.8973545375015533,
+        0.9170040432046711,
+        0.9370838170551498,
+        0.9576032806985735,
+        0.9785720620876999,
+    ],
+    &[
+        0.5,
+        0.5054446430258502,
+        0.5109485743270583,
+        0.5165124395106142,
+        0.5221368912137069,
+        0.5278225891802786,
+        0.5335702003384117,
+        0.5393803988785598,
+        0.5452538663326288,
+        0.5511912916539204,
+        0.5571933712979462,
+        0.5632608093041209,
+        0.5693943173783458,
+        0.5755946149764913,
+        0.5818624293887887,
+        0.5881984958251406,
+        0.5946035575013605,
+        0.6010783657263515,
+        0.6076236799902344,
+        0.6142402680534349,
+        0.620928906036742,
+        0.6276903785123455,
+        0.6345254785958666,
+        0.6414350080393891,
+        0.6484197773255048,
+        0.6554806057623822,
+        0.6626183215798706,
+        0.6698337620266515,
+        0.6771277734684463,
+        0.6845012114872953,
+        0.6919549409819159,
+        0.6994898362691555,
+        0.7071067811865475,
+        0.7148066691959849,
+        0.7225904034885232,
+        0.7304588970903234,
+        0.7384130729697496,
+        0.7464538641456323,
+        0.7545822137967112,
+        0.762799075372269,
+        0.7711054127039704,
+        0.7795022001189185,
+        0.7879904225539431,
+        0.7965710756711334,
+        0.805245165974627,
+        0.8140137109286738,
+        0.8228777390769823,
+        0.8318382901633681,
+        0.8408964152537144,
+        0.8500531768592616,
+        0.8593096490612387,
+        0.8686669176368529,
+        0.8781260801866495,
+        0.8876882462632604,
+        0.8973545375015533,
+        0.9071260877501991,
+        0.9170040432046711,
+        0.9269895625416926,
+        0.9370838170551498,
+        0.9472879907934827,
+        0.9576032806985735,
+        0.9680308967461471,
+        0.9785720620876999,
+        0.9892280131939752,
+    ],
+    &[
+        0.5,
+        0.5027149505564014,
+        0.5054446430258502,
+        0.5081891574554764,
+        0.5109485743270583,
+        0.5137229745593818,
+        0.5165124395106142,
+        0.5193170509806894,
+        0.5221368912137069,
+        0.5249720429003435,
+        0.5278225891802786,
+        0.5306886136446309,
+        0.5335702003384117,
+        0.5364674337629877,
+        0.5393803988785598,
+        0.5423091811066545,
+        0.5452538663326288,
+        0.5482145409081883,
+        0.5511912916539204,
+        0.5541842058618393,
+        0.5571933712979462,
+        0.5602188762048033,
+        0.5632608093041209,
+        0.5663192597993595,
+        0.5693943173783458,
+        0.572486072215902,
+        0.5755946149764913,
+        0.5787200368168754,
+        0.5818624293887887,
+        0.585021884841625,
+        0.5881984958251406,
+        0.5913923554921704,
+        0.5946035575013605,
+        0.5978321960199137,
+        0.6010783657263515,
+        0.6043421618132907,
+        0.6076236799902344,
+        0.6109230164863786,
+        0.6142402680534349,
+        0.6175755319684665,
+        0.620928906036742,
+        0.6243004885946023,
+        0.6276903785123455,
+        0.6310986751971253,
+        0.6345254785958666,
+        0.637970889198196,
+        0.6414350080393891,
+        0.6449179367033329,
+        0.6484197773255048,
+        0.6519406325959679,
+        0.6554806057623822,
+        0.659039800633032,
+        0.6626183215798706,
+        0.6662162735415805,
+        0.6698337620266515,
+        0.6734708931164728,
+        0.6771277734684463,
+        0.6808045103191123,
+        0.6845012114872953,
+        0.688217985377265,
+        0.6919549409819159,
+        0.6957121878859629,
+        0.6994898362691555,
+        0.7032879969095076,
+        0.7071067811865475,
+        0.7109463010845827,
+        0.7148066691959849,
+        0.718687998724491,
+        0.7225904034885232,
+        0.7265139979245261,
+        0.7304588970903234,
+        0.7344252166684908,
+        0.7384130729697496,
+        0.7424225829363761,
+        0.7464538641456323,
+        0.7505070348132126,
+        0.7545822137967112,
+        0.7586795205991071,
+        0.762799075372269,
+        0.7669409989204777,
+        0.7711054127039704,
+        0.7752924388424999,
+        0.7795022001189185,
+        0.7837348199827764,
+        0.7879904225539431,
+        0.7922691326262467,
+        0.7965710756711334,
+        0.8008963778413465,
+        0.805245165974627,
+        0.8096175675974316,
+        0.8140137109286738,
+        0.8184337248834821,
+        0.8228777390769823,
+        0.8273458838280969,
+        0.8318382901633681,
+        0.8363550898207981,
+        0.8408964152537144,
+        0.8454623996346523,
+        0.8500531768592616,
+        0.8546688815502312,
+        0.8593096490612387,
+        0.8639756154809185,
+        0.8686669176368529,
+        0.8733836930995842,
+        0.8781260801866495,
+        0.8828942179666361,
+        0.8876882462632604,
+        0.8925083056594671,
+        0.8973545375015533,
+        0.9022270839033115,
+        0.9071260877501991,
+        0.9120516927035263,
+        0.9170040432046711,
+        0.9219832844793128,
+        0.9269895625416926,
+        0.9320230241988943,
+        0.9370838170551498,
+        0.9421720895161669,
+        0.9472879907934827,
+        0.9524316709088368,
+        0.9576032806985735,
+        0.9628029718180622,
+        0.9680308967461471,
+        0.9732872087896164,
+        0.9785720620876999,
+        0.9838856116165875,
+        0.9892280131939752,
+        0.9945994234836328,
+    ],
+    &[
+        0.5,
+        0.5013556375251013,
+        0.5027149505564014,
+        0.5040779490592088,
+        0.5054446430258502,
+        0.5068150424757447,
+        0.5081891574554764,
+        0.509566998038869,
+        0.5109485743270583,
+        0.5123338964485679,
+        0.5137229745593818,
+        0.5151158188430205,
+        0.5165124395106142,
+        0.5179128468009786,
+        0.5193170509806894,
+        0.520725062344158,
+        0.5221368912137069,
+        0.5235525479396449,
+        0.5249720429003435,
+        0.526395386502313,
+        0.5278225891802786,
+        0.5292536613972564,
+        0.5306886136446309,
+        0.5321274564422321,
+        0.5335702003384117,
+        0.5350168559101208,
+        0.5364674337629877,
+        0.5379219445313954,
+        0.5393803988785598,
+        0.5408428074966075,
+        0.5423091811066545,
+        0.5437795304588847,
+        0.5452538663326288,
+        0.5467321995364429,
+        0.5482145409081883,
+        0.549700901315111,
+        0.5511912916539204,
+        0.5526857228508706,
+        0.5541842058618393,
+        0.5556867516724088,
+        0.5571933712979462,
+        0.5587040757836845,
+        0.5602188762048033,
+        0.5617377836665098,
+        0.5632608093041209,
+        0.564787964283144,
+        0.5663192597993595,
+        0.5678547070789026,
+        0.5693943173783458,
+        0.5709381019847808,
+        0.572486072215902,
+        0.5740382394200894,
+        0.5755946149764913,
+        0.5771552102951081,
+        0.5787200368168754,
+        0.5802891060137493,
+        0.5818624293887887,
+        0.5834400184762408,
+        0.585021884841625,
+        0.5866080400818185,
+        0.5881984958251406,
+        0.5897932637314379,
+        0.5913923554921704,
+        0.5929957828304968,
+        0.5946035575013605,
+        0.5962156912915756,
+        0.5978321960199137,
+        0.5994530835371903,
+        0.6010783657263515,
+        0.6027080545025619,
+        0.6043421618132907,
+        0.6059806996384005,
+        0.6076236799902344,
+        0.6092711149137041,
+        0.6109230164863786,
+        0.6125793968185725,
+        0.6142402680534349,
+        0.6159056423670379,
+        0.6175755319684665,
+        0.6192499490999082,
+        0.620928906036742,
+        0.622612415087629,
+        0.6243004885946023,
+        0.6259931389331581,
+        0.6276903785123455,
+        0.6293922197748583,
+        0.6310986751971253,
+        0.6328097572894031,
+        0.6345254785958666,
+        0.6362458516947014,
+        0.637970889198196,
+        0.6397006037528346,
+        0.6414350080393891,
+        0.6431741147730128,
+        0.6449179367033329,
+        0.6466664866145447,
+        0.6484197773255048,
+        0.6501778216898253,
+        0.6519406325959679,
+        0.6537082229673385,
+        0.6554806057623822,
+        0.6572577939746774,
+        0.659039800633032,
+        0.6608266388015788,
+        0.6626183215798706,
+        0.6644148621029772,
+        0.6662162735415805,
+        0.6680225691020727,
+        0.6698337620266515,
+        0.6716498655934177,
+        0.6734708931164728,
+        0.6752968579460171,
+        0.6771277734684463,
+        0.6789636531064505,
+        0.6808045103191123,
+        0.6826503586020058,
+        0.6845012114872953,
+        0.6863570825438342,
+        0.688217985377265,
+        0.690083933630119,
+        0.6919549409819159,
+        0.6938310211492645,
+        0.6957121878859629,
+        0.6975984549830999,
+        0.6994898362691555,
+        0.7013863456101023,
+        0.7032879969095076,
+        0.7051948041086352,
+        0.7071067811865475,
+        0.7090239421602076,
+        0.7109463010845827,
+        0.7128738720527471,
+        0.7148066691959849,
+        0.7167447066838943,
+        0.718687998724491,
+        0.7206365595643126,
+        0.7225904034885232,
+        0.7245495448210174,
+        0.7265139979245261,
+        0.7284837772007218,
+        0.7304588970903234,
+        0.7324393720732029,
+        0.7344252166684908,
+        0.7364164454346837,
+        0.7384130729697496,
+        0.7404151139112358,
+        0.7424225829363761,
+        0.7444354947621984,
+        0.7464538641456323,
+        0.7484777058836176,
+        0.7505070348132126,
+        0.7525418658117031,
+        0.7545822137967112,
+        0.7566280937263048,
+        0.7586795205991071,
+        0.7607365094544071,
+        0.762799075372269,
+        0.7648672334736434,
+        0.7669409989204777,
+        0.7690203869158282,
+        0.7711054127039704,
+        0.7731960915705107,
+        0.7752924388424999,
+        0.7773944698885442,
+        0.7795022001189185,
+        0.7816156449856788,
+        0.7837348199827764,
+        0.7858597406461707,
+        0.7879904225539431,
+        0.7901268813264122,
+        0.7922691326262467,
+        0.7944171921585818,
+        0.7965710756711334,
+        0.7987307989543135,
+        0.8008963778413465,
+        0.8030678282083853,
+        0.805245165974627,
+        0.8074284071024302,
+        0.8096175675974316,
+        0.8118126635086642,
+        0.8140137109286738,
+        0.8162207259936375,
+        0.8184337248834821,
+        0.820652723822003,
+        0.8228777390769823,
+        0.8251087869603088,
+        0.8273458838280969,
+        0.8295890460808079,
+        0.8318382901633681,
+        0.8340936325652911,
+        0.8363550898207981,
+        0.8386226785089391,
+        0.8408964152537144,
+        0.8431763167241966,
+        0.8454623996346523,
+        0.8477546807446661,
+        0.8500531768592616,
+        0.8523579048290255,
+        0.8546688815502312,
+        0.8569861239649629,
+        0.8593096490612387,
+        0.8616394738731368,
+        0.8639756154809185,
+        0.8663180910111553,
+        0.8686669176368529,
+        0.871022112577578,
+        0.8733836930995842,
+        0.8757516765159389,
+        0.8781260801866495,
+        0.8805069215187917,
+        0.8828942179666361,
+        0.8852879870317771,
+        0.8876882462632604,
+        0.890095013257712,
+        0.8925083056594671,
+        0.8949281411607002,
+        0.8973545375015533,
+        0.8997875124702672,
+        0.9022270839033115,
+        0.9046732696855155,
+        0.9071260877501991,
+        0.909585556079304,
+        0.9120516927035263,
+        0.9145245157024483,
+        0.9170040432046711,
+        0.9194902933879467,
+        0.9219832844793128,
+        0.9244830347552253,
+        0.9269895625416926,
+        0.92950288621441,
+        0.9320230241988943,
+        0.9345499949706191,
+        0.9370838170551498,
+        0.93962450902828,
+        0.9421720895161669,
+        0.9447265771954693,
+        0.9472879907934827,
+        0.9498563490882775,
+        0.9524316709088368,
+        0.9550139751351947,
+        0.9576032806985735,
+        0.9601996065815236,
+        0.9628029718180622,
+        0.9654133954938133,
+        0.9680308967461471,
+        0.9706554947643201,
+        0.9732872087896164,
+        0.9759260581154889,
+        0.9785720620876999,
+        0.9812252401044634,
+        0.9838856116165875,
+        0.9865531961276168,
+        0.9892280131939752,
+        0.9919100824251095,
+        0.9945994234836328,
+        0.9972960560854698,
+    ],
+];
+
+fn bucket_index(schema: i8, v: f64, is_infinite: bool) -> i32 {
+    let v = if is_infinite { f64::MAX } else { v };
+    let (frac, exp) = frexp(v);
+    let mut index = if schema > 0 {
+        let bounds = &native_histogram_bounds()[schema as usize];
+        let bucket = bounds.partition_point(|bound| *bound < frac) as i32;
+        bucket + (exp - 1) * bounds.len() as i32
+    } else {
+        let mut key = exp;
+        if frac == 0.5 {
+            key -= 1;
+        }
+        let offset = (1_i32 << (-(schema as i32) as u32)) - 1;
+        (key + offset) >> (-(schema as i32) as u32)
+    };
+
+    if is_infinite {
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+fn frexp(v: f64) -> (f64, i32) {
+    debug_assert!(v >= 0.0);
+    debug_assert!(!v.is_nan());
+
+    if v == 0.0 {
+        return (0.0, 0);
+    }
+
+    let bits = v.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let mantissa = bits & ((1_u64 << 52) - 1);
+
+    if exponent == 0 {
+        let p = 63 - mantissa.leading_zeros() as i32;
+        let frac = mantissa as f64 / 2f64.powi(p + 1);
+        (frac, p - 1073)
+    } else {
+        let frac = ((1_u64 << 52) | mantissa) as f64 / 2f64.powi(53);
+        (frac, exponent - 1022)
+    }
+}
+
+fn enforce_bucket_limit(inner: &mut NativeHistogramState) -> bool {
+    if inner.max_buckets == 0 {
+        return false;
+    }
+
+    if inner.positive.len() + inner.negative.len() <= inner.max_buckets {
+        return false;
+    }
+
+    if inner.scheduled_reset.is_none()
+        && inner
+            .min_reset_duration
+            .and_then(|min_reset_duration| {
+                inner
+                    .created
+                    .elapsed()
+                    .ok()
+                    .map(|e| e >= min_reset_duration)
+            })
+            .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let mut degraded = false;
+    while inner.positive.len() + inner.negative.len() > inner.max_buckets {
+        if widen_zero_bucket(inner) {
+            degraded = true;
+            continue;
+        }
+
+        if inner.schema > SCHEMA_MIN {
+            inner.schema -= 1;
+            inner.positive = downsample_buckets(&inner.positive);
+            inner.negative = downsample_buckets(&inner.negative);
+            degraded = true;
+            continue;
+        }
+
+        break;
+    }
+
+    if degraded {
+        inner.schedule_reset_after_degradation();
+    }
+
+    false
+}
+
+fn widen_zero_bucket(inner: &mut NativeHistogramState) -> bool {
+    let smallest_key = match (
+        inner.positive.keys().next().copied(),
+        inner.negative.keys().next().copied(),
+    ) {
+        (Some(positive), Some(negative)) => positive.min(negative),
+        (Some(positive), None) => positive,
+        (None, Some(negative)) => negative,
+        (None, None) => return false,
+    };
+
+    let new_threshold = positive_upper_bound(inner.schema, smallest_key);
+    let current_threshold = if inner.zero_threshold < 0.0 {
+        0.0
+    } else {
+        inner.zero_threshold
+    };
+    if new_threshold <= current_threshold || new_threshold > inner.max_zero_threshold {
+        return false;
+    }
+
+    let moved_positive = move_to_zero_bucket(inner.schema, new_threshold, &mut inner.positive);
+    let moved_negative = move_to_zero_bucket(inner.schema, new_threshold, &mut inner.negative);
+
+    let moved = moved_positive + moved_negative;
+    if moved == 0 {
+        return false;
+    }
+
+    inner.zero_count += moved;
+    inner.zero_threshold = new_threshold;
+    true
+}
+
+fn move_to_zero_bucket(schema: i8, threshold: f64, buckets: &mut BTreeMap<i32, u64>) -> u64 {
+    if buckets.is_empty() {
+        return 0;
+    }
+
+    let mut moved = 0u64;
+    let mut delete_until: Option<i32> = None;
+    for (index, count) in buckets.iter() {
+        let upper = positive_upper_bound(schema, *index);
+        if upper <= threshold {
+            moved += *count;
+            delete_until = Some(*index);
+        } else {
+            break;
+        }
+    }
+
+    if let Some(last) = delete_until {
+        buckets.retain(|index, _| *index > last);
+    }
+
+    moved
+}
+
+fn positive_upper_bound(schema: i8, index: i32) -> f64 {
+    if schema < 0 {
+        let exp = index << (-(schema as i32) as u32);
+        if exp == 1024 {
+            return f64::MAX;
+        }
+        return 2f64.powi(exp);
+    }
+
+    let bounds = &native_histogram_bounds()[schema as usize];
+    let frac = bounds[(index & ((1 << schema) - 1)) as usize];
+    let exp = (index >> schema) + 1;
+    if frac == 0.5 && exp == 1025 {
+        return f64::MAX;
+    }
+    frac * 2f64.powi(exp)
+}
+
+fn downsample_buckets(buckets: &BTreeMap<i32, u64>) -> BTreeMap<i32, u64> {
+    let mut downsampled = BTreeMap::new();
+    for (index, count) in buckets {
+        let mut key = *index;
+        if key > 0 {
+            key += 1;
+        }
+        key /= 2;
+        *downsampled.entry(key).or_insert(0) += *count;
+    }
+    downsampled
+}
+
+fn encode_spans_and_deltas(
+    buckets: &BTreeMap<i32, u64>,
+) -> Result<(Vec<(i32, u32)>, Vec<i64>), std::fmt::Error> {
+    let mut deltas = Vec::with_capacity(buckets.len());
+    let mut previous_count = 0i64;
+    let mut next_index = 0i32;
+    let mut spans: Vec<(i32, u32)> = Vec::new();
+
+    let mut append_delta = |count: i64, spans: &mut Vec<(i32, u32)>| {
+        if let Some((_, len)) = spans.last_mut() {
+            *len += 1;
+        }
+        deltas.push(count - previous_count);
+        previous_count = count;
+    };
+
+    for (n, (&index, &count)) in buckets.iter().enumerate() {
+        let count = i64::try_from(count).map_err(|_| std::fmt::Error)?;
+        let index_delta = index - next_index;
+
+        if n == 0 || index_delta > 2 {
+            spans.push((index_delta, 0));
+        } else {
+            for _ in 0..index_delta {
+                append_delta(0, &mut spans);
+            }
+        }
+
+        append_delta(count, &mut spans);
+        next_index = index + 1;
+    }
+
+    Ok((spans, deltas))
 }
 
 #[cfg(test)]
@@ -272,5 +1383,307 @@ mod tests {
             1234.0,
             "histogram sum records accurate sum of observations"
         );
+    }
+
+    #[test]
+    fn native_histogram_stores_sparse_buckets() {
+        let h = Histogram::new_native(NativeHistogramConfig::with_schema(0));
+        h.observe(1.0);
+        h.observe(4.0);
+        h.observe(-2.0);
+        h.observe(0.0);
+
+        let inner = h.inner.read();
+        let native = inner.native.as_ref().unwrap();
+        assert_eq!(4, inner.count);
+        assert_eq!(1, native.zero_count);
+        assert_eq!(2, native.positive.len());
+        assert_eq!(3, native.negative.len() + native.positive.len());
+    }
+
+    #[test]
+    fn native_histogram_counts_nan_without_sparse_bucket() {
+        let h = Histogram::new_native(NativeHistogramConfig::with_schema(2));
+        h.observe(f64::NAN);
+        assert_eq!(1, h.count());
+        assert!(h.sum().is_nan());
+
+        let inner = h.inner.read();
+        let native = inner.native.as_ref().unwrap();
+        assert_eq!(0, native.zero_count);
+        assert!(native.positive.is_empty());
+        assert!(native.negative.is_empty());
+    }
+
+    #[test]
+    fn classic_histogram_counts_nan_in_infinity_bucket() {
+        let h = Histogram::new_classic([1.0, 2.0]);
+        h.observe(f64::NAN);
+
+        let inner = h.inner.read();
+        assert_eq!(1, inner.count);
+        assert!(inner.sum.is_nan());
+        assert_eq!(1, inner.buckets[2].1);
+    }
+
+    #[test]
+    fn native_histogram_supports_zero_width_zero_bucket() {
+        let h = Histogram::new_native(
+            NativeHistogramConfig::with_schema(0)
+                .zero_threshold(NATIVE_HISTOGRAM_ZERO_THRESHOLD_ZERO),
+        );
+        h.observe(0.0);
+        h.observe(0.01);
+
+        let inner = h.inner.read();
+        let native = inner.native.as_ref().unwrap();
+        assert_eq!(1, native.zero_count);
+        assert_eq!(1, native.positive.values().sum::<u64>());
+    }
+
+    #[test]
+    fn native_histogram_reduces_resolution_when_max_bucket_limit_is_hit() {
+        let h = Histogram::new_native(NativeHistogramConfig::with_schema(8).max_buckets(1));
+        h.observe(1.0);
+        h.observe(1.1);
+
+        let inner = h.inner.read();
+        let native = inner.native.as_ref().unwrap();
+        assert!(native.schema < 8);
+    }
+
+    #[test]
+    fn native_histogram_widens_zero_bucket_before_reducing_resolution() {
+        let h = Histogram::new_native(
+            NativeHistogramConfig::with_schema(8)
+                .max_buckets(1)
+                .max_zero_threshold(1.0),
+        );
+        h.observe(2f64.powi(-100));
+        h.observe(1.0);
+
+        let inner = h.inner.read();
+        let native = inner.native.as_ref().unwrap();
+        assert_eq!(8, native.schema);
+        assert_eq!(1, native.zero_count);
+        assert_eq!(1, native.positive.len());
+    }
+
+    #[test]
+    fn native_histogram_schedules_reset_after_degradation() {
+        let h = Histogram::new_native(
+            NativeHistogramConfig::with_schema(8)
+                .max_buckets(1)
+                .min_reset_duration(Duration::from_secs(60)),
+        );
+        h.observe(1.0);
+        h.observe(1.1);
+
+        {
+            let mut inner = h.inner.write();
+            let native = inner.native.as_mut().unwrap();
+            assert!(native.schema < 8);
+            assert!(native.scheduled_reset.is_some());
+            native.scheduled_reset = Some(SystemTime::now() - Duration::from_secs(1));
+        }
+
+        let (_sum, count, _buckets, native) = h.snapshot().unwrap();
+        let native = native.unwrap();
+
+        assert_eq!(0, count);
+        assert_eq!(8, native.schema);
+        assert_eq!(0, native.zero_count);
+        assert!(native.positive_spans.is_empty());
+        assert!(native.negative_spans.is_empty());
+    }
+
+    #[test]
+    fn native_histogram_resets_when_limit_is_hit_after_min_reset_duration() {
+        let h = Histogram::new_native(
+            NativeHistogramConfig::with_schema(8)
+                .max_buckets(1)
+                .min_reset_duration(Duration::from_secs(1)),
+        );
+        h.observe(1.0);
+        {
+            let mut inner = h.inner.write();
+            inner.native.as_mut().unwrap().created = SystemTime::now() - Duration::from_secs(2);
+        }
+        h.observe(2.0);
+
+        let inner = h.inner.read();
+        let native = inner.native.as_ref().unwrap();
+        assert_eq!(1, inner.count);
+        assert_eq!(2.0, inner.sum);
+        assert_eq!(8, native.schema);
+        assert_eq!(1, native.positive.values().sum::<u64>());
+    }
+
+    #[test]
+    fn native_histogram_zero_min_reset_duration_does_not_reset() {
+        let h = Histogram::new_native(
+            NativeHistogramConfig::with_schema(8)
+                .max_buckets(1)
+                .min_reset_duration(Duration::ZERO),
+        );
+        h.observe(1.0);
+        h.observe(1.1);
+
+        let inner = h.inner.read();
+        let native = inner.native.as_ref().unwrap();
+        assert_eq!(2, inner.count);
+        assert!(native.schema < 8);
+        assert!(native.scheduled_reset.is_none());
+    }
+
+    #[test]
+    fn native_histogram_supports_bucket_factor_constructor() {
+        let h = Histogram::new_native(NativeHistogramConfig::new(1.1));
+        let inner = h.inner.read();
+        assert_eq!(3, inner.native.as_ref().unwrap().schema);
+    }
+
+    #[test]
+    fn native_histogram_default_uses_recommended_bucket_factor() {
+        let h = Histogram::new_native(NativeHistogramConfig::default());
+        let inner = h.inner.read();
+        assert_eq!(3, inner.native.as_ref().unwrap().schema);
+    }
+
+    #[test]
+    fn native_histogram_maps_positive_infinity_into_sparse_bucket() {
+        let h = Histogram::new_native(NativeHistogramConfig::with_schema(4));
+        h.observe(f64::INFINITY);
+        let inner = h.inner.read();
+        let native = inner.native.as_ref().unwrap();
+        assert_eq!(Some(&1), native.positive.get(&16385));
+        assert!(!native.positive.contains_key(&i32::MAX));
+    }
+
+    #[test]
+    fn native_histogram_widens_zero_bucket_at_min_schema_when_limited() {
+        let mut inner = NativeHistogramState {
+            initial_zero_threshold: 0.0,
+            initial_schema: SCHEMA_MIN,
+            zero_threshold: 0.0,
+            zero_count: 0,
+            schema: SCHEMA_MIN,
+            max_buckets: 1,
+            min_reset_duration: None,
+            max_zero_threshold: 1.0,
+            created: SystemTime::now(),
+            scheduled_reset: None,
+            positive: BTreeMap::from([(-10, 2), (0, 1)]),
+            negative: BTreeMap::new(),
+        };
+
+        assert!(widen_zero_bucket(&mut inner));
+        assert!(inner.zero_threshold > 0.0);
+        assert!(inner.zero_count >= 2);
+    }
+
+    #[test]
+    fn native_histogram_encodes_spans_and_deltas() {
+        let mut buckets = BTreeMap::new();
+        buckets.insert(-10, 1);
+        buckets.insert(-7, 7);
+        buckets.insert(-5, 7);
+        buckets.insert(2, 8);
+
+        let (spans, deltas) = encode_spans_and_deltas(&buckets).unwrap();
+
+        assert_eq!(spans, vec![(-10, 6), (6, 1)]);
+        assert_eq!(deltas, vec![1, -1, 0, 7, -7, 7, 1]);
+    }
+
+    #[test]
+    fn native_histogram_downsamples_like_go_client() {
+        let buckets = BTreeMap::from([(-2, 1), (-1, 2), (0, 4), (1, 8)]);
+
+        let downsampled = downsample_buckets(&buckets);
+
+        assert_eq!(downsampled, BTreeMap::from([(-1, 1), (0, 6), (1, 8)]));
+    }
+
+    #[test]
+    fn native_histogram_positive_upper_bound_uses_bucket_index() {
+        assert_eq!(1.0, positive_upper_bound(0, 0));
+        assert_eq!(2.0, positive_upper_bound(0, 1));
+        assert!((positive_upper_bound(3, 8) - 2.0).abs() <= 4.0 * f64::EPSILON);
+        assert_eq!(f64::MAX, positive_upper_bound(0, 1024));
+        assert_eq!(f64::INFINITY, positive_upper_bound(0, 1025));
+        assert_eq!(f64::MAX, positive_upper_bound(8, 262144));
+        assert_eq!(f64::INFINITY, positive_upper_bound(8, 262145));
+    }
+
+    #[test]
+    fn native_histogram_bucket_index_matches_standard_boundaries() {
+        assert_eq!(0, bucket_index(0, 1.0, false));
+        assert_eq!(
+            1,
+            bucket_index(0, f64::from_bits(1.0f64.to_bits() + 1), false)
+        );
+        assert_eq!(8, bucket_index(3, 2.0, false));
+        assert_eq!(
+            -1074,
+            bucket_index(0, f64::MIN_POSITIVE / 2f64.powi(52), false)
+        );
+        assert_eq!(1024, bucket_index(0, f64::MAX, false));
+        assert_eq!(1025, bucket_index(0, f64::INFINITY, true));
+        assert_eq!(262144, bucket_index(8, f64::MAX, false));
+        assert_eq!(262145, bucket_index(8, f64::INFINITY, true));
+    }
+
+    #[test]
+    fn native_histogram_bounds_match_client_golang_constants() {
+        let bounds = native_histogram_bounds();
+        assert_eq!(1, bounds[0].len());
+        assert_eq!(256, bounds[8].len());
+        assert_eq!(0.5013556375251013, bounds[8][1]);
+        assert_eq!(0.7071067811865475, bounds[8][128]);
+        assert_eq!(0.9972960560854698, bounds[8][255]);
+    }
+
+    #[test]
+    fn native_histogram_no_op_span_marks_zero_width_nan_only_histogram() {
+        let h = Histogram::new_native(
+            NativeHistogramConfig::with_schema(0)
+                .zero_threshold(NATIVE_HISTOGRAM_ZERO_THRESHOLD_ZERO),
+        );
+        h.observe(f64::NAN);
+
+        let (_sum, count, _buckets, native) = h.snapshot().unwrap();
+        let native = native.unwrap();
+
+        assert_eq!(1, count);
+        assert_eq!(0.0, native.zero_threshold);
+        assert_eq!(0, native.zero_count);
+        assert_eq!(vec![(0, 0)], native.positive_spans);
+        assert!(native.positive_deltas.is_empty());
+        assert!(native.negative_spans.is_empty());
+    }
+
+    #[test]
+    fn native_histogram_fails_for_counts_not_fitting_delta_wire_type() {
+        let mut buckets = BTreeMap::new();
+        buckets.insert(0, i64::MAX as u64 + 1);
+
+        assert!(encode_spans_and_deltas(&buckets).is_err());
+    }
+
+    #[test]
+    fn classic_and_native_histogram_updates_both_representations() {
+        let h =
+            Histogram::new_classic_and_native([1.0, 2.0], NativeHistogramConfig::with_schema(0));
+        h.observe(1.0);
+        h.observe(4.0);
+
+        let inner = h.inner.read();
+        let native = inner.native.as_ref().unwrap();
+        assert_eq!(2, inner.count);
+        assert_eq!(5.0, inner.sum);
+        assert_eq!(1, inner.buckets[0].1);
+        assert_eq!(1, inner.buckets[2].1);
+        assert_eq!(2, native.positive.values().sum::<u64>());
     }
 }

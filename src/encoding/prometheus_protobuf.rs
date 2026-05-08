@@ -35,7 +35,11 @@ pub mod prometheus_data_model {
 }
 
 use prost::Message;
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::metrics::MetricType;
 use crate::registry::{Registry, Unit};
@@ -354,6 +358,95 @@ impl MetricEncoder<'_> {
 
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_histogram_with_native<S: EncodeLabelSet>(
+        &mut self,
+        sum: f64,
+        count: u64,
+        buckets: &[(f64, u64)],
+        exemplars: Option<&HashMap<usize, Exemplar<S, f64>>>,
+        schema: i32,
+        zero_threshold: f64,
+        zero_count: u64,
+        negative_spans: &[(i32, u32)],
+        negative_deltas: &[i64],
+        positive_spans: &[(i32, u32)],
+        positive_deltas: &[i64],
+        created: Option<SystemTime>,
+    ) -> Result<(), std::fmt::Error> {
+        let mut cumulative_count = 0;
+        let bucket = buckets
+            .iter()
+            .enumerate()
+            .map(|(i, (upper_bound, count))| {
+                cumulative_count += count;
+                Ok(prometheus_data_model::Bucket {
+                    cumulative_count,
+                    cumulative_count_float: 0.0,
+                    upper_bound: *upper_bound,
+                    exemplar: exemplars
+                        .and_then(|exemplars| exemplars.get(&i).map(|exemplar| exemplar.try_into()))
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, std::fmt::Error>>()?;
+        let start_timestamp = created.map(system_time_to_timestamp).transpose()?;
+
+        let negative_span = negative_spans
+            .iter()
+            .map(|(offset, length)| prometheus_data_model::BucketSpan {
+                offset: *offset,
+                length: *length,
+            })
+            .collect();
+
+        let positive_span = positive_spans
+            .iter()
+            .map(|(offset, length)| prometheus_data_model::BucketSpan {
+                offset: *offset,
+                length: *length,
+            })
+            .collect();
+
+        self.family.push(prometheus_data_model::Metric {
+            label: self.labels.clone(),
+            histogram: Some(prometheus_data_model::Histogram {
+                sample_count: count,
+                sample_count_float: 0.0,
+                sample_sum: sum,
+                bucket,
+                start_timestamp,
+                schema,
+                zero_threshold,
+                zero_count,
+                zero_count_float: 0.0,
+                negative_span,
+                negative_delta: negative_deltas.to_vec(),
+                negative_count: Vec::new(),
+                positive_span,
+                positive_delta: positive_deltas.to_vec(),
+                positive_count: Vec::new(),
+                exemplars: Vec::new(),
+            }),
+            ..Default::default()
+        });
+
+        Ok(())
+    }
+}
+
+fn system_time_to_timestamp(
+    system_time: SystemTime,
+) -> Result<prost_types::Timestamp, std::fmt::Error> {
+    let duration = system_time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| std::fmt::Error)?;
+
+    Ok(prost_types::Timestamp {
+        seconds: duration.as_secs() as i64,
+        nanos: duration.subsec_nanos() as i32,
+    })
 }
 
 impl<S: EncodeLabelSet, V: EncodeExemplarValue> TryFrom<&Exemplar<S, V>>
@@ -516,7 +609,9 @@ mod tests {
     use crate::metrics::exemplar::{CounterWithExemplar, HistogramWithExemplars};
     use crate::metrics::family::Family;
     use crate::metrics::gauge::Gauge;
-    use crate::metrics::histogram::{exponential_buckets, Histogram};
+    use crate::metrics::histogram::{
+        exponential_buckets, Histogram, NativeHistogramConfig, NATIVE_HISTOGRAM_ZERO_THRESHOLD_ZERO,
+    };
     use crate::metrics::info::Info;
     use crate::registry::Unit;
     use std::borrow::Cow;
@@ -759,6 +854,78 @@ mod tests {
         assert_eq!(2.0, exemplar.value);
         assert_eq!(Some(now_ts), exemplar.timestamp.clone());
         assert_eq!("99", exemplar.label[0].value);
+    }
+
+    #[test]
+    fn encode_native_histogram() {
+        let histogram = Histogram::new_native(NativeHistogramConfig::with_schema(0));
+        let mut registry = Registry::default();
+        registry.register("my_histogram", "My histogram", histogram.clone());
+
+        histogram.observe(1.0);
+        histogram.observe(4.0);
+        histogram.observe(-2.0);
+
+        let metric_families = encode(&registry).unwrap();
+        let histogram = metric_families[0].metric[0].histogram.as_ref().unwrap();
+
+        assert_eq!(3, histogram.sample_count);
+        assert_eq!(3.0, histogram.sample_sum);
+        assert_eq!(0, histogram.schema);
+        assert_eq!(1, histogram.negative_span.len());
+        assert_eq!(1, histogram.positive_span.len());
+        assert_eq!(vec![1], histogram.negative_delta);
+        assert_eq!(vec![1, -1, 1], histogram.positive_delta);
+        assert!(histogram.bucket.is_empty());
+        assert!(histogram.start_timestamp.is_some());
+    }
+
+    #[test]
+    fn encode_native_histogram_nan_only_has_no_op_span() {
+        let histogram = Histogram::new_native(
+            NativeHistogramConfig::with_schema(0)
+                .zero_threshold(NATIVE_HISTOGRAM_ZERO_THRESHOLD_ZERO),
+        );
+        let mut registry = Registry::default();
+        registry.register("my_histogram", "My histogram", histogram.clone());
+
+        histogram.observe(f64::NAN);
+
+        let metric_families = encode(&registry).unwrap();
+        let histogram = metric_families[0].metric[0].histogram.as_ref().unwrap();
+
+        assert_eq!(1, histogram.sample_count);
+        assert!(histogram.sample_sum.is_nan());
+        assert_eq!(0.0, histogram.zero_threshold);
+        assert_eq!(0, histogram.zero_count);
+        assert_eq!(1, histogram.positive_span.len());
+        assert_eq!(0, histogram.positive_span[0].offset);
+        assert_eq!(0, histogram.positive_span[0].length);
+        assert!(histogram.positive_delta.is_empty());
+        assert!(histogram.negative_span.is_empty());
+    }
+
+    #[test]
+    fn encode_classic_and_native_histogram() {
+        let histogram =
+            Histogram::new_classic_and_native([1.0, 2.0], NativeHistogramConfig::with_schema(0));
+        let mut registry = Registry::default();
+        registry.register("my_histogram", "My histogram", histogram.clone());
+
+        histogram.observe(1.0);
+        histogram.observe(4.0);
+
+        let metric_families = encode(&registry).unwrap();
+        let histogram = metric_families[0].metric[0].histogram.as_ref().unwrap();
+
+        assert_eq!(2, histogram.sample_count);
+        assert_eq!(5.0, histogram.sample_sum);
+        assert_eq!(3, histogram.bucket.len());
+        assert_eq!(1, histogram.bucket[0].cumulative_count);
+        assert_eq!(2, histogram.bucket[2].cumulative_count);
+        assert_eq!(0, histogram.schema);
+        assert!(!histogram.positive_span.is_empty());
+        assert!(!histogram.positive_delta.is_empty());
     }
 
     #[test]

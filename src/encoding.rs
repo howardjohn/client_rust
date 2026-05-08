@@ -237,6 +237,47 @@ impl MetricEncoder<'_> {
         )
     }
 
+    /// Encode a histogram that may have native buckets.
+    ///
+    /// Encoders without native histogram support encode the classic buckets when
+    /// present and reject native-only histograms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_histogram_with_native<S: EncodeLabelSet>(
+        &mut self,
+        sum: f64,
+        count: u64,
+        buckets: &[(f64, u64)],
+        exemplars: Option<&HashMap<usize, Exemplar<S, f64>>>,
+        schema: i32,
+        zero_threshold: f64,
+        zero_count: u64,
+        negative_spans: &[(i32, u32)],
+        negative_deltas: &[i64],
+        positive_spans: &[(i32, u32)],
+        positive_deltas: &[i64],
+        created: Option<SystemTime>,
+    ) -> Result<(), std::fmt::Error> {
+        for_both_mut!(
+            self,
+            MetricEncoderInner,
+            e,
+            e.encode_histogram_with_native(
+                sum,
+                count,
+                buckets,
+                exemplars,
+                schema,
+                zero_threshold,
+                zero_count,
+                negative_spans,
+                negative_deltas,
+                positive_spans,
+                positive_deltas,
+                created,
+            )
+        )
+    }
+
     /// Encode a metric family.
     pub fn encode_family<'s, S: EncodeLabelSet>(
         &'s mut self,
