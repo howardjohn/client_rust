@@ -5,8 +5,7 @@
 use crate::encoding::{EncodeMetric, MetricEncoder, NoLabelSet};
 
 use super::{MetricType, TypedMetric};
-use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
-use std::collections::BTreeMap;
+use parking_lot::Mutex;
 use std::iter::{self, once};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -46,7 +45,7 @@ const SCHEMA_MAX: i8 = 8;
 // https://github.com/tikv/rust-prometheus/pull/314.
 #[derive(Debug)]
 pub struct Histogram {
-    inner: Arc<RwLock<Inner>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl Clone for Histogram {
@@ -169,9 +168,11 @@ struct NativeHistogramState {
     max_zero_threshold: f64,
     created: SystemTime,
     scheduled_reset: Option<SystemTime>,
-    positive: BTreeMap<i32, u64>,
-    negative: BTreeMap<i32, u64>,
+    positive: NativeBuckets,
+    negative: NativeBuckets,
 }
+
+type NativeBuckets = Vec<(i32, u64)>;
 
 #[derive(Debug)]
 struct NativeHistogramSnapshot {
@@ -199,8 +200,8 @@ impl NativeHistogramState {
             max_zero_threshold: config.max_zero_threshold,
             created,
             scheduled_reset: None,
-            positive: BTreeMap::new(),
-            negative: BTreeMap::new(),
+            positive: Vec::new(),
+            negative: Vec::new(),
         }
     }
 
@@ -212,9 +213,9 @@ impl NativeHistogramState {
 
         let index = bucket_index(self.schema, v.abs(), v.is_infinite());
         if v.is_sign_negative() {
-            *self.negative.entry(index).or_insert(0) += 1;
+            increment_bucket(&mut self.negative, index);
         } else {
-            *self.positive.entry(index).or_insert(0) += 1;
+            increment_bucket(&mut self.positive, index);
         }
 
         enforce_bucket_limit(self)
@@ -295,7 +296,7 @@ impl Histogram {
     /// Create a new classic [`Histogram`].
     pub fn new_classic(buckets: impl IntoIterator<Item = f64>) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 sum: Default::default(),
                 count: Default::default(),
                 buckets: buckets
@@ -315,7 +316,7 @@ impl Histogram {
     /// histogram fields and reject native-only histograms.
     pub fn new_native(native: NativeHistogramConfig) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 sum: Default::default(),
                 count: Default::default(),
                 buckets: Vec::new(),
@@ -334,7 +335,7 @@ impl Histogram {
         native: NativeHistogramConfig,
     ) -> Self {
         let histogram = Self::new_classic(buckets);
-        histogram.inner.write().native = Some(NativeHistogramState::new(native));
+        histogram.inner.lock().native = Some(NativeHistogramState::new(native));
         histogram
     }
 
@@ -346,13 +347,13 @@ impl Histogram {
     /// Returns the current sum of all observations.
     #[cfg(any(test, feature = "test-util"))]
     pub fn sum(&self) -> f64 {
-        self.inner.read().sum
+        self.inner.lock().sum
     }
 
     /// Returns the current number of observations.
     #[cfg(any(test, feature = "test-util"))]
     pub fn count(&self) -> u64 {
-        self.inner.read().count
+        self.inner.lock().count
     }
 
     /// Observes the given value, returning the index of the first bucket the
@@ -361,8 +362,8 @@ impl Histogram {
     /// Needed in
     /// [`HistogramWithExemplars`](crate::metrics::exemplar::HistogramWithExemplars).
     pub(crate) fn observe_and_bucket(&self, v: f64) -> Option<usize> {
-        let mut inner = self.inner.write();
-        reset_if_scheduled(&mut inner, SystemTime::now());
+        let mut inner = self.inner.lock();
+        reset_if_scheduled(&mut inner);
         let mut bucket = observe_classic(&mut inner, v);
 
         let reset = if let Some(native) = &mut inner.native {
@@ -385,19 +386,19 @@ impl Histogram {
         bucket
     }
 
-    pub(crate) fn get(&self) -> (f64, u64, MappedRwLockReadGuard<'_, Vec<(f64, u64)>>) {
-        let inner = self.inner.read();
+    pub(crate) fn get(&self) -> (f64, u64, Vec<(f64, u64)>) {
+        let inner = self.inner.lock();
         let sum = inner.sum;
         let count = inner.count;
-        let buckets = RwLockReadGuard::map(inner, |inner| &inner.buckets);
+        let buckets = inner.buckets.clone();
         (sum, count, buckets)
     }
 
     fn snapshot(
         &self,
     ) -> Result<(f64, u64, Vec<(f64, u64)>, Option<NativeHistogramSnapshot>), std::fmt::Error> {
-        let mut inner = self.inner.write();
-        reset_if_scheduled(&mut inner, SystemTime::now());
+        let mut inner = self.inner.lock();
+        reset_if_scheduled(&mut inner);
         let native = inner
             .native
             .as_ref()
@@ -483,6 +484,10 @@ fn observe_classic(inner: &mut Inner, v: f64) -> Option<usize> {
     inner.sum += v;
     inner.count += 1;
 
+    if inner.buckets.is_empty() {
+        return None;
+    }
+
     let first_bucket = if v.is_nan() {
         inner.buckets.iter_mut().enumerate().next_back()
     } else {
@@ -513,13 +518,16 @@ fn reset_observations(inner: &mut Inner, created: SystemTime) {
     }
 }
 
-fn reset_if_scheduled(inner: &mut Inner, now: SystemTime) {
-    if inner
-        .native
-        .as_ref()
-        .map(|native| native.reset_is_due(now))
-        .unwrap_or(false)
-    {
+fn reset_if_scheduled(inner: &mut Inner) {
+    let Some(native) = inner.native.as_ref() else {
+        return;
+    };
+    if native.scheduled_reset.is_none() {
+        return;
+    }
+
+    let now = SystemTime::now();
+    if native.reset_is_due(now) {
         reset_observations(inner, now);
     }
 }
@@ -529,6 +537,13 @@ fn in_zero_bucket(zero_threshold: f64, v: f64) -> bool {
         v == 0.0
     } else {
         v.abs() <= zero_threshold
+    }
+}
+
+fn increment_bucket(buckets: &mut NativeBuckets, index: i32) {
+    match buckets.binary_search_by_key(&index, |(bucket_index, _)| *bucket_index) {
+        Ok(position) => buckets[position].1 += 1,
+        Err(position) => buckets.insert(position, (index, 1)),
     }
 }
 
@@ -1171,8 +1186,8 @@ fn enforce_bucket_limit(inner: &mut NativeHistogramState) -> bool {
 
 fn widen_zero_bucket(inner: &mut NativeHistogramState) -> bool {
     let smallest_key = match (
-        inner.positive.keys().next().copied(),
-        inner.negative.keys().next().copied(),
+        inner.positive.first().map(|(index, _)| *index),
+        inner.negative.first().map(|(index, _)| *index),
     ) {
         (Some(positive), Some(negative)) => positive.min(negative),
         (Some(positive), None) => positive,
@@ -1203,26 +1218,23 @@ fn widen_zero_bucket(inner: &mut NativeHistogramState) -> bool {
     true
 }
 
-fn move_to_zero_bucket(schema: i8, threshold: f64, buckets: &mut BTreeMap<i32, u64>) -> u64 {
+fn move_to_zero_bucket(schema: i8, threshold: f64, buckets: &mut NativeBuckets) -> u64 {
     if buckets.is_empty() {
         return 0;
     }
 
-    let mut moved = 0u64;
-    let mut delete_until: Option<i32> = None;
-    for (index, count) in buckets.iter() {
+    let mut split = 0;
+    for (index, _count) in buckets.iter() {
         let upper = positive_upper_bound(schema, *index);
         if upper <= threshold {
-            moved += *count;
-            delete_until = Some(*index);
+            split += 1;
         } else {
             break;
         }
     }
 
-    if let Some(last) = delete_until {
-        buckets.retain(|index, _| *index > last);
-    }
+    let moved = buckets[..split].iter().map(|(_, count)| *count).sum();
+    buckets.drain(..split);
 
     moved
 }
@@ -1245,21 +1257,27 @@ fn positive_upper_bound(schema: i8, index: i32) -> f64 {
     frac * 2f64.powi(exp)
 }
 
-fn downsample_buckets(buckets: &BTreeMap<i32, u64>) -> BTreeMap<i32, u64> {
-    let mut downsampled = BTreeMap::new();
+fn downsample_buckets(buckets: &NativeBuckets) -> NativeBuckets {
+    let mut downsampled: NativeBuckets = Vec::with_capacity(buckets.len());
     for (index, count) in buckets {
         let mut key = *index;
         if key > 0 {
             key += 1;
         }
         key /= 2;
-        *downsampled.entry(key).or_insert(0) += *count;
+        if let Some((last_key, last_count)) = downsampled.last_mut() {
+            if *last_key == key {
+                *last_count += *count;
+                continue;
+            }
+        }
+        downsampled.push((key, *count));
     }
     downsampled
 }
 
 fn encode_spans_and_deltas(
-    buckets: &BTreeMap<i32, u64>,
+    buckets: &NativeBuckets,
 ) -> Result<(Vec<(i32, u32)>, Vec<i64>), std::fmt::Error> {
     let mut deltas = Vec::with_capacity(buckets.len());
     let mut previous_count = 0i64;
@@ -1274,7 +1292,7 @@ fn encode_spans_and_deltas(
         previous_count = count;
     };
 
-    for (n, (&index, &count)) in buckets.iter().enumerate() {
+    for (n, &(index, count)) in buckets.iter().enumerate() {
         let count = i64::try_from(count).map_err(|_| std::fmt::Error)?;
         let index_delta = index - next_index;
 
@@ -1393,7 +1411,7 @@ mod tests {
         h.observe(-2.0);
         h.observe(0.0);
 
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         let native = inner.native.as_ref().unwrap();
         assert_eq!(4, inner.count);
         assert_eq!(1, native.zero_count);
@@ -1408,7 +1426,7 @@ mod tests {
         assert_eq!(1, h.count());
         assert!(h.sum().is_nan());
 
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         let native = inner.native.as_ref().unwrap();
         assert_eq!(0, native.zero_count);
         assert!(native.positive.is_empty());
@@ -1420,7 +1438,7 @@ mod tests {
         let h = Histogram::new_classic([1.0, 2.0]);
         h.observe(f64::NAN);
 
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         assert_eq!(1, inner.count);
         assert!(inner.sum.is_nan());
         assert_eq!(1, inner.buckets[2].1);
@@ -1435,10 +1453,13 @@ mod tests {
         h.observe(0.0);
         h.observe(0.01);
 
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         let native = inner.native.as_ref().unwrap();
         assert_eq!(1, native.zero_count);
-        assert_eq!(1, native.positive.values().sum::<u64>());
+        assert_eq!(
+            1,
+            native.positive.iter().map(|(_, count)| *count).sum::<u64>()
+        );
     }
 
     #[test]
@@ -1447,7 +1468,7 @@ mod tests {
         h.observe(1.0);
         h.observe(1.1);
 
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         let native = inner.native.as_ref().unwrap();
         assert!(native.schema < 8);
     }
@@ -1462,7 +1483,7 @@ mod tests {
         h.observe(2f64.powi(-100));
         h.observe(1.0);
 
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         let native = inner.native.as_ref().unwrap();
         assert_eq!(8, native.schema);
         assert_eq!(1, native.zero_count);
@@ -1480,7 +1501,7 @@ mod tests {
         h.observe(1.1);
 
         {
-            let mut inner = h.inner.write();
+            let mut inner = h.inner.lock();
             let native = inner.native.as_mut().unwrap();
             assert!(native.schema < 8);
             assert!(native.scheduled_reset.is_some());
@@ -1506,17 +1527,20 @@ mod tests {
         );
         h.observe(1.0);
         {
-            let mut inner = h.inner.write();
+            let mut inner = h.inner.lock();
             inner.native.as_mut().unwrap().created = SystemTime::now() - Duration::from_secs(2);
         }
         h.observe(2.0);
 
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         let native = inner.native.as_ref().unwrap();
         assert_eq!(1, inner.count);
         assert_eq!(2.0, inner.sum);
         assert_eq!(8, native.schema);
-        assert_eq!(1, native.positive.values().sum::<u64>());
+        assert_eq!(
+            1,
+            native.positive.iter().map(|(_, count)| *count).sum::<u64>()
+        );
     }
 
     #[test]
@@ -1529,7 +1553,7 @@ mod tests {
         h.observe(1.0);
         h.observe(1.1);
 
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         let native = inner.native.as_ref().unwrap();
         assert_eq!(2, inner.count);
         assert!(native.schema < 8);
@@ -1539,14 +1563,14 @@ mod tests {
     #[test]
     fn native_histogram_supports_bucket_factor_constructor() {
         let h = Histogram::new_native(NativeHistogramConfig::new(1.1));
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         assert_eq!(3, inner.native.as_ref().unwrap().schema);
     }
 
     #[test]
     fn native_histogram_default_uses_recommended_bucket_factor() {
         let h = Histogram::new_native(NativeHistogramConfig::default());
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         assert_eq!(3, inner.native.as_ref().unwrap().schema);
     }
 
@@ -1554,10 +1578,17 @@ mod tests {
     fn native_histogram_maps_positive_infinity_into_sparse_bucket() {
         let h = Histogram::new_native(NativeHistogramConfig::with_schema(4));
         h.observe(f64::INFINITY);
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         let native = inner.native.as_ref().unwrap();
-        assert_eq!(Some(&1), native.positive.get(&16385));
-        assert!(!native.positive.contains_key(&i32::MAX));
+        assert_eq!(
+            Some(1),
+            native
+                .positive
+                .iter()
+                .find(|(index, _)| *index == 16385)
+                .map(|(_, count)| *count)
+        );
+        assert!(!native.positive.iter().any(|(index, _)| *index == i32::MAX));
     }
 
     #[test]
@@ -1573,8 +1604,8 @@ mod tests {
             max_zero_threshold: 1.0,
             created: SystemTime::now(),
             scheduled_reset: None,
-            positive: BTreeMap::from([(-10, 2), (0, 1)]),
-            negative: BTreeMap::new(),
+            positive: vec![(-10, 2), (0, 1)],
+            negative: Vec::new(),
         };
 
         assert!(widen_zero_bucket(&mut inner));
@@ -1584,11 +1615,7 @@ mod tests {
 
     #[test]
     fn native_histogram_encodes_spans_and_deltas() {
-        let mut buckets = BTreeMap::new();
-        buckets.insert(-10, 1);
-        buckets.insert(-7, 7);
-        buckets.insert(-5, 7);
-        buckets.insert(2, 8);
+        let buckets = vec![(-10, 1), (-7, 7), (-5, 7), (2, 8)];
 
         let (spans, deltas) = encode_spans_and_deltas(&buckets).unwrap();
 
@@ -1598,11 +1625,11 @@ mod tests {
 
     #[test]
     fn native_histogram_downsamples_like_go_client() {
-        let buckets = BTreeMap::from([(-2, 1), (-1, 2), (0, 4), (1, 8)]);
+        let buckets = vec![(-2, 1), (-1, 2), (0, 4), (1, 8)];
 
         let downsampled = downsample_buckets(&buckets);
 
-        assert_eq!(downsampled, BTreeMap::from([(-1, 1), (0, 6), (1, 8)]));
+        assert_eq!(downsampled, vec![(-1, 1), (0, 6), (1, 8)]);
     }
 
     #[test]
@@ -1665,8 +1692,7 @@ mod tests {
 
     #[test]
     fn native_histogram_fails_for_counts_not_fitting_delta_wire_type() {
-        let mut buckets = BTreeMap::new();
-        buckets.insert(0, i64::MAX as u64 + 1);
+        let buckets = vec![(0, i64::MAX as u64 + 1)];
 
         assert!(encode_spans_and_deltas(&buckets).is_err());
     }
@@ -1678,12 +1704,15 @@ mod tests {
         h.observe(1.0);
         h.observe(4.0);
 
-        let inner = h.inner.read();
+        let inner = h.inner.lock();
         let native = inner.native.as_ref().unwrap();
         assert_eq!(2, inner.count);
         assert_eq!(5.0, inner.sum);
         assert_eq!(1, inner.buckets[0].1);
         assert_eq!(1, inner.buckets[2].1);
-        assert_eq!(2, native.positive.values().sum::<u64>());
+        assert_eq!(
+            2,
+            native.positive.iter().map(|(_, count)| *count).sum::<u64>()
+        );
     }
 }
